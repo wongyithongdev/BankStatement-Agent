@@ -1,0 +1,27 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+venv/
+.venv/
+
+# Claude/Agent runtime
+.claude/
+.agent/
+
+# Output files (generated at runtime)
+*.xlsx
+*.csv
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

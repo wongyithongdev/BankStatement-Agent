@@ -76,4 +76,3 @@ Both must pass before export.
 ## License
 
 MIT
-# BankStatement-Agent
