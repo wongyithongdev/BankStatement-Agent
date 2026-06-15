@@ -9,20 +9,27 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-_WORK_DIR   = Path(__file__).parent.parent.parent
-_VENV_PYTHON = _WORK_DIR / "venv" / "bin" / "python"
-_STDOUT_CAP  = 8000
-_STDERR_CAP  = 2000
+_WORK_DIR      = Path(__file__).parent.parent.parent
+_VENV_PYTHON   = _WORK_DIR / "venv" / "bin" / "python"
+_OUTPUT_DIR    = Path(os.getenv("OUTPUT_DIR", "/tmp/bankstatement/outputs"))
+_STDOUT_CAP    = 8000
+_STDERR_CAP    = 2000
 _SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "bankstatement-sandbox:latest")
 _USE_DOCKER    = os.getenv("USE_DOCKER_SANDBOX", "true").lower() == "true"
 
+# Cached at first call — Docker availability doesn't change at runtime
+_docker_ok: bool | None = None
+
 
 def _docker_available() -> bool:
-    try:
-        subprocess.run(["docker", "info"], capture_output=True, timeout=5, check=True)
-        return True
-    except Exception:
-        return False
+    global _docker_ok
+    if _docker_ok is None:
+        try:
+            subprocess.run(["docker", "info"], capture_output=True, timeout=5, check=True)
+            _docker_ok = True
+        except Exception:
+            _docker_ok = False
+    return _docker_ok
 
 
 def run_python(code: str, description: str = "") -> dict:
@@ -30,10 +37,11 @@ def run_python(code: str, description: str = "") -> dict:
     Execute a Python script in a Docker sandbox (or venv fallback).
     Returns {ok, exit_code, stdout, stderr, description}.
     """
+    import shutil
+
     tmp = None
     tmp_dir = None
     try:
-        # Write script to temp file
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", delete=False, dir="/tmp"
         ) as f:
@@ -43,8 +51,10 @@ def run_python(code: str, description: str = "") -> dict:
         tmp_dir = tempfile.mkdtemp(prefix="bsagent_")
 
         if _USE_DOCKER and _docker_available():
-            # Copy script into isolated temp dir
-            import shutil
+            # Place script at /sandbox/script.py inside the container.
+            # Mount _OUTPUT_DIR at the same host path so agent scripts can write
+            # xlsx files there without remapping the path they receive.
+            _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             script_in_tmp = Path(tmp_dir) / "script.py"
             shutil.copy(tmp, script_in_tmp)
 
@@ -54,13 +64,13 @@ def run_python(code: str, description: str = "") -> dict:
                 "--cpus=1",
                 "--network=none",
                 "-v", f"{_WORK_DIR}:/workspace:ro",
-                "-v", f"{tmp_dir}:/tmp",
+                "-v", f"{tmp_dir}:/sandbox:ro",          # script, read-only
+                "-v", f"{_OUTPUT_DIR}:{_OUTPUT_DIR}",     # output dir, writable, same path
                 _SANDBOX_IMAGE,
-                "python", "/tmp/script.py",
+                "python", "/sandbox/script.py",
             ]
             timeout = 60
         else:
-            # Fallback: venv subprocess
             cmd = [str(_VENV_PYTHON), str(tmp)]
             timeout = 30
 
@@ -108,5 +118,4 @@ def run_python(code: str, description: str = "") -> dict:
         if tmp and tmp.exists():
             tmp.unlink(missing_ok=True)
         if tmp_dir:
-            import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)

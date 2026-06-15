@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 
+import httpx
 import redis.asyncio as aioredis
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -70,6 +71,10 @@ async def startup():
     )
     app.state.rpm_limiter = GlobalRPMLimiter(app.state.redis)
     app.state.active_tasks: set = set()
+    app.state.http_client = httpx.AsyncClient(
+        timeout=10,
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+    )
 
     # Ensure table + new columns exist
     async with app.state.db.begin() as conn:
@@ -119,6 +124,7 @@ async def shutdown():
         except asyncio.TimeoutError:
             logger.warning("shutdown: timed out waiting for tasks, forcing exit")
 
+    await app.state.http_client.aclose()
     await app.state.db.dispose()
     await app.state.redis.aclose()
     logger.info("shutdown complete")

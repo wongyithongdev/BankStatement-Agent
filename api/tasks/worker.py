@@ -4,9 +4,7 @@ pushes SSE events, updates Postgres + Redis cache.
 """
 
 import asyncio
-import json
 import logging
-from pathlib import Path
 
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -19,7 +17,6 @@ from agent.main import BankStatementAgent
 
 logger = logging.getLogger(__name__)
 
-# Keywords that signal state transitions
 _STATE_SIGNALS = {
     "extracting": ["parse", "extract", "transaction", "parsing", "extracting"],
     "verifying":  ["level 1", "level 2", "verification", "verify", "l1", "l2"],
@@ -47,7 +44,7 @@ async def run_task(
 ) -> None:
     current_state = "investigating"
     messages: list[dict] = []
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()   # correct API inside an async function
 
     async def _update(status: str, **kwargs):
         nonlocal current_state
@@ -62,31 +59,32 @@ async def run_task(
 
     def _callback(event_type: str, data: dict) -> None:
         if event_type == "turn_start":
-            # Acquire a global RPM slot before each AI call (blocking in thread)
+            # Acquire a global RPM slot before each AI call (blocks the agent thread)
             future = asyncio.run_coroutine_threadsafe(rpm_limiter.acquire(), loop)
-            future.result()  # block the agent thread until a slot is free
+            future.result()
+            return
+
+        if event_type == "message":
+            messages.append(data)
             return
 
         if event_type == "token":
             loop.call_soon_threadsafe(
-                asyncio.ensure_future,
+                loop.create_task,
                 publish(redis, task_id, "token", {"task_id": task_id, **data})
             )
             detected = _detect_state(data.get("text", ""))
             if detected and detected != current_state:
                 loop.call_soon_threadsafe(
-                    asyncio.ensure_future,
+                    loop.create_task,
                     _update(detected)
                 )
 
         elif event_type == "tool":
             loop.call_soon_threadsafe(
-                asyncio.ensure_future,
+                loop.create_task,
                 publish(redis, task_id, "tool", {"task_id": task_id, **data})
             )
-
-        elif event_type == "message":
-            messages.append(data)
 
     try:
         await _update("investigating")
@@ -105,7 +103,6 @@ async def run_task(
         if result.get("status") == "completed":
             actual_xlsx = result.get("xlsx_path", xlsx_path)
 
-            # Upload to file server
             file_code = None
             file_link = None
             try:
@@ -132,7 +129,8 @@ async def run_task(
                 "xlsx_rows": result.get("xlsx_rows", 0),
             })
         else:
-            error_msg = (result.get("raw_response") or "")[-500:] or "Unknown error"
+            raw = result.get("raw_response")
+            error_msg = (str(raw)[-500:] if raw else "") or "Unknown error"
             await _update("failed", error=error_msg, chat_history=messages)
             await publish(redis, task_id, "done", {
                 "task_id": task_id,

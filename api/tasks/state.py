@@ -22,8 +22,10 @@ async def create_task(
     user_id: str,
     pdf_path: str,
     task_name: str = "",
+    task_id: Optional[str] = None,
 ) -> str:
-    task_id = str(uuid.uuid4())
+    if task_id is None:
+        task_id = str(uuid.uuid4())
     async with db.begin() as conn:
         await conn.execute(text("""
             INSERT INTO bankstatement

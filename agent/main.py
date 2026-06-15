@@ -174,6 +174,10 @@ class BankStatementAgent:
 
             finish_reason, full_content, tool_calls = self._stream_turn(messages, status_callback=status_callback)
 
+            # Record the complete assistant message for chat history
+            if status_callback and full_content:
+                status_callback("message", {"role": "assistant", "content": full_content, "turn": turn + 1})
+
             self.state["trace"].append(
                 {"turn": turn + 1, "finish_reason": finish_reason}
             )

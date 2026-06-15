@@ -4,12 +4,13 @@ All concurrent agent tasks share this single bucket (75 req/min).
 """
 
 import asyncio
+import os
 import time
 
 import redis.asyncio as aioredis
 
 GLOBAL_RPM_KEY   = "bankstatement:global:rpm"
-GLOBAL_RPM_LIMIT = int(__import__("os").getenv("GLOBAL_RPM_LIMIT", "75"))
+GLOBAL_RPM_LIMIT = int(os.getenv("GLOBAL_RPM_LIMIT", "75"))
 WINDOW_SECONDS   = 60
 
 
@@ -22,6 +23,7 @@ class GlobalRPMLimiter:
         """
         Block the caller until a slot is available within the 75 RPM window.
         Uses Redis sorted set as the sliding window; score = timestamp.
+        The asyncio.Lock serialises check-then-add within a single process.
         """
         while True:
             async with self._lock:

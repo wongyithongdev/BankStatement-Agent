@@ -11,11 +11,10 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
-from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from api.auth import get_current_user, require_book_access
-from api.sse import sse_response
+from api.sse import sse_done_response, sse_response
 from api.tasks.state import (
     create_task,
     get_task,
@@ -72,7 +71,7 @@ async def upload_pdf(
     book_id: str = Form(...),
     user: dict = Depends(get_current_user),
 ):
-    await require_book_access(book_id, "book.read", user["token"])
+    await require_book_access(book_id, "book.read", user["token"], request.app.state.http_client)
 
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
@@ -80,9 +79,7 @@ async def upload_pdf(
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # task_name = filename without extension
     task_name = Path(file.filename).stem
-
     task_id   = str(uuid.uuid4())
     pdf_path  = str(UPLOAD_DIR / f"{task_id}.pdf")
     xlsx_path = str(OUTPUT_DIR / f"{task_id}.xlsx")
@@ -95,18 +92,18 @@ async def upload_pdf(
     redis = request.app.state.redis
     rpm   = request.app.state.rpm_limiter
 
-    db_task_id = await create_task(db, book_id, user["user_id"], pdf_path, task_name=task_name)
+    # Pass our pre-generated task_id so file paths and DB record share the same UUID
+    await create_task(db, book_id, user["user_id"], pdf_path, task_name=task_name, task_id=task_id)
 
-    # Fire and forget — pass task_id returned by DB (same uuid we generated)
     active_tasks: set = request.app.state.active_tasks
     bg = asyncio.create_task(
-        run_task(db_task_id, pdf_path, xlsx_path, book_id, task_name, db, redis, rpm)
+        run_task(task_id, pdf_path, xlsx_path, book_id, task_name, db, redis, rpm)
     )
     active_tasks.add(bg)
     bg.add_done_callback(active_tasks.discard)
 
-    logger.info("task=%s created book=%s user=%s", db_task_id, book_id, user["user_id"])
-    return TaskCreatedResponse(task_id=db_task_id, task_name=task_name, status="queued")
+    logger.info("task=%s created book=%s user=%s", task_id, book_id, user["user_id"])
+    return TaskCreatedResponse(task_id=task_id, task_name=task_name, status="queued")
 
 
 # ── GET /tasks ─────────────────────────────────────────────────────────────
@@ -119,7 +116,7 @@ async def list_book_tasks(
     offset: int = 0,
     user: dict = Depends(get_current_user),
 ):
-    await require_book_access(book_id, "book.read", user["token"])
+    await require_book_access(book_id, "book.read", user["token"], request.app.state.http_client)
     db = request.app.state.db
     rows = await list_tasks(db, book_id, limit=limit, offset=offset)
     tasks = [
@@ -149,7 +146,7 @@ async def get_task_detail(
     task = await get_task(db, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    await require_book_access(task["book_id"], "book.read", user["token"])
+    await require_book_access(task["book_id"], "book.read", user["token"], request.app.state.http_client)
     task.pop("chat_history", None)
     return task
 
@@ -166,10 +163,14 @@ async def stream_task(
     task = await get_task(db, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    await require_book_access(task["book_id"], "book.read", user["token"])
+    await require_book_access(task["book_id"], "book.read", user["token"], request.app.state.http_client)
 
-    redis = request.app.state.redis
-    return sse_response(redis, task_id)
+    # If the task already finished before the client connected, return a
+    # synthetic done event immediately — the Redis pubsub message is gone.
+    if task["status"] in ("completed", "failed"):
+        return sse_done_response(task_id, task["status"], task.get("file_link"))
+
+    return sse_response(request.app.state.redis, task_id)
 
 
 # ── GET /tasks/{task_id}/chat ──────────────────────────────────────────────
@@ -184,7 +185,7 @@ async def get_chat_history(
     task = await get_task(db, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    await require_book_access(task["book_id"], "book.read", user["token"])
+    await require_book_access(task["book_id"], "book.read", user["token"], request.app.state.http_client)
 
     messages = await get_task_chat(db, task_id)
     return {"task_id": task_id, "messages": messages, "count": len(messages)}
@@ -202,7 +203,7 @@ async def download_xlsx(
     task = await get_task(db, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    await require_book_access(task["book_id"], "book.read", user["token"])
+    await require_book_access(task["book_id"], "book.read", user["token"], request.app.state.http_client)
 
     if task["status"] != "completed":
         raise HTTPException(
@@ -214,4 +215,5 @@ async def download_xlsx(
     if not file_link:
         raise HTTPException(status_code=404, detail="Output file not available")
 
+    from fastapi.responses import RedirectResponse
     return RedirectResponse(url=file_link, status_code=302)
