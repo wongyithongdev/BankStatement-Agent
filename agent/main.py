@@ -5,6 +5,7 @@ Investigates PDF, extracts transactions, exports XLSX, verifies output.
 """
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -14,6 +15,8 @@ from dotenv import load_dotenv
 
 from .system_prompt import SYSTEM_PROMPT
 from .tools.read_skills import read_skills_doc
+
+logger = logging.getLogger(__name__)
 
 # Load .env if it exists
 load_dotenv(Path(__file__).parent.parent / ".env")
@@ -109,6 +112,9 @@ PROVIDERS = {
 
 
 class BankStatementAgent:
+    CTX_COMPRESS_THRESHOLD = int(os.getenv("CTX_COMPRESS_THRESHOLD", "700000"))
+    CTX_KEEP_RECENT_TURNS  = int(os.getenv("CTX_KEEP_RECENT_TURNS", "3"))
+
     def __init__(
         self,
         api_key: str = None,
@@ -135,6 +141,66 @@ class BankStatementAgent:
             "skills_loaded": False,
             "trace": [],
         }
+
+    # ------------------------------------------------------------------
+    # Context management
+    # ------------------------------------------------------------------
+
+    def _estimate_tokens(self, messages: list) -> int:
+        """Rough token estimate: total chars / 4."""
+        return sum(
+            len(str(m.get("content", ""))) + len(str(m.get("tool_calls", "")))
+            for m in messages
+        ) // 4
+
+    def _compress_context(self, messages: list) -> list:
+        """
+        Compress old turns when approaching the token threshold.
+        Keeps: system + initial user task + last CTX_KEEP_RECENT_TURNS turns verbatim.
+        Compresses middle turns: tool results truncated to exit_code + 150-char stdout,
+        assistant messages truncated to 300 chars.
+        """
+        estimated = self._estimate_tokens(messages)
+        if estimated < self.CTX_COMPRESS_THRESHOLD:
+            return messages
+
+        header = messages[:2]                        # system + initial user
+        rest   = messages[2:]
+        keep   = self.CTX_KEEP_RECENT_TURNS * 2     # 2 messages per turn
+
+        if len(rest) <= keep:
+            return messages                          # nothing to compress
+
+        to_compress = rest[:-keep]
+        to_keep     = rest[-keep:]
+
+        compressed = []
+        for msg in to_compress:
+            role = msg.get("role", "")
+            if role == "tool":
+                try:
+                    data = json.loads(msg.get("content", "{}"))
+                    short = {
+                        "exit_code": data.get("exit_code"),
+                        "stdout":    (data.get("stdout") or "")[:150],
+                    }
+                except Exception:
+                    short = {"summary": str(msg.get("content", ""))[:150]}
+                compressed.append({**msg, "content": json.dumps(short)})
+            elif role == "assistant":
+                content = str(msg.get("content") or "")
+                short_content = (content[:300] + "…[compressed]") if len(content) > 300 else content
+                compressed.append({**msg, "content": short_content})
+            else:
+                compressed.append(msg)
+
+        new_messages = header + compressed + to_keep
+        logger.info(
+            "context compressed: %d→%d msgs, ~%d→%d tokens",
+            len(messages), len(new_messages),
+            estimated, self._estimate_tokens(new_messages),
+        )
+        return new_messages
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -166,6 +232,8 @@ class BankStatementAgent:
         stop_without_output = 0  # how many times agent stopped but produced no files
 
         for turn in range(self.max_turns):
+            messages = self._compress_context(messages)
+
             print(f"\n{'─'*60}")
             print(f"[Turn {turn + 1}]")
 
