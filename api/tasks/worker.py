@@ -128,42 +128,54 @@ async def run_task(
                 file_link=file_link,
             )
             current_state = "completed"
-            await publish(redis, task_id, "done", {
-                "task_id": task_id,
-                "status": "completed",
-                "file_link": file_link,
-                "xlsx_rows": result.get("xlsx_rows", 0),
-            })
+            try:
+                await publish(redis, task_id, "done", {
+                    "task_id": task_id,
+                    "status": "completed",
+                    "file_link": file_link,
+                    "xlsx_rows": result.get("xlsx_rows", 0),
+                })
+            except Exception as exc:
+                logger.warning("task=%s redis publish failed (data still saved): %s", task_id, exc)
 
         elif agent_status == "completed_no_output":
             error_msg = "Agent completed all turns but produced no Excel output"
             logger.warning("task=%s completed_no_output", task_id)
             await _update("failed", error=error_msg, chat_history=messages)
-            await publish(redis, task_id, "done", {
-                "task_id": task_id,
-                "status": "failed",
-                "error": error_msg,
-            })
+            try:
+                await publish(redis, task_id, "done", {
+                    "task_id": task_id,
+                    "status": "failed",
+                    "error": error_msg,
+                })
+            except Exception as exc:
+                logger.warning("task=%s redis publish failed: %s", task_id, exc)
 
         else:
             raw = result.get("raw_response")
             error_msg = (str(raw)[-500:] if raw else "") or "Unknown error"
             await _update("failed", error=error_msg, chat_history=messages)
-            await publish(redis, task_id, "done", {
-                "task_id": task_id,
-                "status": "failed",
-                "error": error_msg,
-            })
+            try:
+                await publish(redis, task_id, "done", {
+                    "task_id": task_id,
+                    "status": "failed",
+                    "error": error_msg,
+                })
+            except Exception as exc:
+                logger.warning("task=%s redis publish failed: %s", task_id, exc)
 
     except Exception as exc:
         logger.exception("task=%s unhandled error", task_id)
         error_msg = str(exc)
         await update_task_status(db, redis, task_id, "failed", error=error_msg)
-        await publish(redis, task_id, "done", {
-            "task_id": task_id,
-            "status": "failed",
-            "error": error_msg,
-        })
+        try:
+            await publish(redis, task_id, "done", {
+                "task_id": task_id,
+                "status": "failed",
+                "error": error_msg,
+            })
+        except Exception as pub_exc:
+            logger.warning("task=%s redis publish failed: %s", task_id, pub_exc)
 
     finally:
         # Clean up the uploaded PDF — it is no longer needed after the agent finishes
