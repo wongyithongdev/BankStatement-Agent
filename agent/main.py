@@ -169,6 +169,9 @@ class BankStatementAgent:
             print(f"\n{'─'*60}")
             print(f"[Turn {turn + 1}]")
 
+            if status_callback:
+                status_callback("turn_start", {"turn": turn + 1})
+
             finish_reason, full_content, tool_calls = self._stream_turn(messages, status_callback=status_callback)
 
             self.state["trace"].append(

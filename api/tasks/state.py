@@ -16,15 +16,27 @@ REDIS_CACHE_TTL = 300  # seconds
 
 # ── Postgres CRUD ──────────────────────────────────────────────────────────
 
-async def create_task(db: AsyncEngine, book_id: str, user_id: str, pdf_path: str) -> str:
+async def create_task(
+    db: AsyncEngine,
+    book_id: str,
+    user_id: str,
+    pdf_path: str,
+    task_name: str = "",
+) -> str:
     task_id = str(uuid.uuid4())
     async with db.begin() as conn:
         await conn.execute(text("""
             INSERT INTO bankstatement
-                (task_id, book_id, user_id, status, pdf_path, created_at, updated_at)
+                (task_id, book_id, user_id, status, pdf_path, task_name, created_at, updated_at)
             VALUES
-                (:task_id, :book_id, :user_id, 'queued', :pdf_path, NOW(), NOW())
-        """), {"task_id": task_id, "book_id": book_id, "user_id": user_id, "pdf_path": pdf_path})
+                (:task_id, :book_id, :user_id, 'queued', :pdf_path, :task_name, NOW(), NOW())
+        """), {
+            "task_id": task_id,
+            "book_id": book_id,
+            "user_id": user_id,
+            "pdf_path": pdf_path,
+            "task_name": task_name,
+        })
     return task_id
 
 
@@ -40,16 +52,21 @@ async def get_task(db: AsyncEngine, task_id: str) -> Optional[dict]:
     return dict(row)
 
 
-async def list_tasks(db: AsyncEngine, book_id: str, user_id: str, limit: int = 20, offset: int = 0) -> list[dict]:
+async def list_tasks(
+    db: AsyncEngine,
+    book_id: str,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict]:
     async with db.connect() as conn:
         result = await conn.execute(text("""
-            SELECT task_id, status, book_id, user_id, pdf_path, xlsx_path,
-                   current_turn, error, created_at, updated_at
+            SELECT task_id, task_name, user_id, status,
+                   created_at, updated_at, file_link
             FROM bankstatement
-            WHERE book_id = :book_id AND user_id = :user_id
+            WHERE book_id = :book_id
             ORDER BY created_at DESC
             LIMIT :limit OFFSET :offset
-        """), {"book_id": book_id, "user_id": user_id, "limit": limit, "offset": offset})
+        """), {"book_id": book_id, "limit": limit, "offset": offset})
         return [dict(r) for r in result.mappings()]
 
 
@@ -63,8 +80,10 @@ async def update_task_status(
     xlsx_path: Optional[str] = None,
     error: Optional[str] = None,
     chat_history: Optional[list] = None,
+    file_code: Optional[str] = None,
+    file_link: Optional[str] = None,
 ) -> None:
-    fields = {"status": status, "updated_at": datetime.now(timezone.utc)}
+    fields: dict = {"status": status, "updated_at": datetime.now(timezone.utc)}
     if current_turn is not None:
         fields["current_turn"] = current_turn
     if xlsx_path is not None:
@@ -73,6 +92,10 @@ async def update_task_status(
         fields["error"] = error
     if chat_history is not None:
         fields["chat_history"] = json.dumps(chat_history)
+    if file_code is not None:
+        fields["file_code"] = file_code
+    if file_link is not None:
+        fields["file_link"] = file_link
 
     set_clause = ", ".join(f"{k} = :{k}" for k in fields)
     fields["task_id"] = task_id
@@ -83,7 +106,6 @@ async def update_task_status(
             fields
         )
 
-    # Update Redis cache
     cache_key = f"bankstatement:task:{task_id}:status"
     await redis.set(cache_key, status, ex=REDIS_CACHE_TTL)
 

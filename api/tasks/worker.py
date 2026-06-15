@@ -5,15 +5,19 @@ pushes SSE events, updates Postgres + Redis cache.
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from api.fileserver import upload_xlsx
+from api.ratelimit import GlobalRPMLimiter
 from api.sse import publish
 from api.tasks.state import update_task_status
 from agent.main import BankStatementAgent
 
+logger = logging.getLogger(__name__)
 
 # Keywords that signal state transitions
 _STATE_SIGNALS = {
@@ -35,11 +39,15 @@ async def run_task(
     task_id: str,
     pdf_path: str,
     xlsx_path: str,
+    book_id: str,
+    task_name: str,
     db: AsyncEngine,
     redis: aioredis.Redis,
+    rpm_limiter: GlobalRPMLimiter,
 ) -> None:
     current_state = "investigating"
     messages: list[dict] = []
+    loop = asyncio.get_event_loop()
 
     async def _update(status: str, **kwargs):
         nonlocal current_state
@@ -53,17 +61,18 @@ async def run_task(
             })
 
     def _callback(event_type: str, data: dict) -> None:
-        # Run in thread context — schedule coroutine on the event loop
-        loop = asyncio.get_event_loop()
+        if event_type == "turn_start":
+            # Acquire a global RPM slot before each AI call (blocking in thread)
+            future = asyncio.run_coroutine_threadsafe(rpm_limiter.acquire(), loop)
+            future.result()  # block the agent thread until a slot is free
+            return
 
         if event_type == "token":
             loop.call_soon_threadsafe(
                 asyncio.ensure_future,
                 publish(redis, task_id, "token", {"task_id": task_id, **data})
             )
-            # Detect state from accumulated agent text
-            text = data.get("text", "")
-            detected = _detect_state(text)
+            detected = _detect_state(data.get("text", ""))
             if detected and detected != current_state:
                 loop.call_soon_threadsafe(
                     asyncio.ensure_future,
@@ -84,8 +93,6 @@ async def run_task(
 
         agent = BankStatementAgent()
 
-        # Run agent in executor (blocking)
-        loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
             lambda: agent.extract(
@@ -96,20 +103,36 @@ async def run_task(
         )
 
         if result.get("status") == "completed":
-            await _update(
-                "completed",
-                xlsx_path=result.get("xlsx_path", xlsx_path),
+            actual_xlsx = result.get("xlsx_path", xlsx_path)
+
+            # Upload to file server
+            file_code = None
+            file_link = None
+            try:
+                upload_resp = await upload_xlsx(actual_xlsx, book_id, task_name)
+                file_code = upload_resp.get("code")
+                file_link = upload_resp.get("link")
+                logger.info("task=%s uploaded to file server: %s", task_id, file_link)
+            except Exception as exc:
+                logger.warning("task=%s file server upload failed: %s", task_id, exc)
+
+            await update_task_status(
+                db, redis, task_id, "completed",
+                xlsx_path=actual_xlsx,
                 current_turn=result.get("turns_used", 0),
                 chat_history=messages,
+                file_code=file_code,
+                file_link=file_link,
             )
+            current_state = "completed"
             await publish(redis, task_id, "done", {
                 "task_id": task_id,
                 "status": "completed",
-                "xlsx_path": result.get("xlsx_path", xlsx_path),
+                "file_link": file_link,
                 "xlsx_rows": result.get("xlsx_rows", 0),
             })
         else:
-            error_msg = result.get("raw_response", "")[-500:] if result.get("raw_response") else "Unknown error"
+            error_msg = (result.get("raw_response") or "")[-500:] or "Unknown error"
             await _update("failed", error=error_msg, chat_history=messages)
             await publish(redis, task_id, "done", {
                 "task_id": task_id,
@@ -118,6 +141,7 @@ async def run_task(
             })
 
     except Exception as exc:
+        logger.exception("task=%s unhandled error", task_id)
         error_msg = str(exc)
         await update_task_status(db, redis, task_id, "failed", error=error_msg)
         await publish(redis, task_id, "done", {
