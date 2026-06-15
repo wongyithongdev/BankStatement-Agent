@@ -21,7 +21,7 @@ async def get_current_user(
     token = credentials.credentials
     client: httpx.AsyncClient = request.app.state.http_client
     resp = await client.get(
-        f"{AUTH_SERVER_BASE}/api/v1/users/me",
+        f"{AUTH_SERVER_BASE}/auth/api/v1/users/me",
         headers={"Authorization": f"Bearer {token}"},
     )
     if resp.status_code != 200:
@@ -39,7 +39,7 @@ async def require_book_access(
     http_client: httpx.AsyncClient,
 ) -> None:
     resp = await http_client.post(
-        f"{AUTH_SERVER_BASE}/api/v1/permissions/check",
+        f"{AUTH_SERVER_BASE}/auth/api/v1/permissions/check",
         headers={"Authorization": f"Bearer {token}"},
         json={"book_id": book_id, "action": action},
     )
