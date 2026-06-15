@@ -140,7 +140,7 @@ class BankStatementAgent:
     # Public entry point
     # ------------------------------------------------------------------
 
-    def extract(self, pdf_path: str, output_path: str = None) -> dict:
+    def extract(self, pdf_path: str, output_path: str = None, status_callback=None) -> dict:
         pdf_path = str(Path(pdf_path).resolve())
         if output_path is None:
             output_path = str(Path(pdf_path).with_suffix(".xlsx"))
@@ -169,7 +169,7 @@ class BankStatementAgent:
             print(f"\n{'─'*60}")
             print(f"[Turn {turn + 1}]")
 
-            finish_reason, full_content, tool_calls = self._stream_turn(messages)
+            finish_reason, full_content, tool_calls = self._stream_turn(messages, status_callback=status_callback)
 
             self.state["trace"].append(
                 {"turn": turn + 1, "finish_reason": finish_reason}
@@ -204,6 +204,13 @@ class BankStatementAgent:
                     except json.JSONDecodeError:
                         inputs = {}
                     result = self._execute_tool(tc["name"], inputs)
+                    if status_callback and tc["name"] == "run_python":
+                        status_callback("tool", {
+                            "tool": tc["name"],
+                            "desc": inputs.get("description", ""),
+                            "exit": result.get("exit_code", 0),
+                            "preview": (result.get("stdout") or "")[:200],
+                        })
                     messages.append(
                         {
                             "role": "tool",
@@ -285,7 +292,7 @@ class BankStatementAgent:
     # Streaming
     # ------------------------------------------------------------------
 
-    def _stream_turn(self, messages: list) -> tuple[str, str, dict]:
+    def _stream_turn(self, messages: list, status_callback=None) -> tuple[str, str, dict]:
         """
         Stream one API call.
         Returns (finish_reason, full_content, tool_calls_map).
@@ -324,6 +331,8 @@ class BankStatementAgent:
             if delta.content:
                 text = delta.content
                 full_content += text
+                if status_callback:
+                    status_callback("token", {"text": text, "is_thinking": in_think_tag})
 
                 # colorize <think> blocks inline as they stream
                 while text:
