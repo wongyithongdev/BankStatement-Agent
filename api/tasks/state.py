@@ -54,6 +54,15 @@ async def get_task(db: AsyncEngine, task_id: str) -> Optional[dict]:
     return dict(row)
 
 
+async def count_tasks(db: AsyncEngine, book_id: str) -> int:
+    async with db.connect() as conn:
+        result = await conn.execute(
+            text("SELECT COUNT(*) FROM bankstatement WHERE book_id = :book_id"),
+            {"book_id": book_id},
+        )
+        return result.scalar() or 0
+
+
 async def list_tasks(
     db: AsyncEngine,
     book_id: str,

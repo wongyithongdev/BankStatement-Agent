@@ -4,10 +4,14 @@ SSE helpers — publish events to Redis, consume as Server-Sent Events.
 
 import asyncio
 import json
+import os
 from typing import AsyncIterator
 
 import redis.asyncio as aioredis
 from fastapi.responses import StreamingResponse
+
+# Maximum time to hold an SSE connection open (default 30 minutes)
+_SSE_MAX_SECONDS = int(os.getenv("SSE_MAX_SECONDS", "1800"))
 
 _SSE_HEADERS = {
     "Cache-Control": "no-cache",
@@ -29,30 +33,35 @@ async def _event_stream(redis: aioredis.Redis, task_id: str) -> AsyncIterator[st
     pubsub = redis.pubsub()
     await pubsub.subscribe(_channel(task_id))
     try:
-        while True:
-            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30)
-            if message is None:
-                yield ": keepalive\n\n"
-                await asyncio.sleep(1)
-                continue
+        async with asyncio.timeout(_SSE_MAX_SECONDS):
+            while True:
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30)
+                if message is None:
+                    yield ": keepalive\n\n"
+                    await asyncio.sleep(1)
+                    continue
 
-            raw = message.get("data", "")
-            if not isinstance(raw, (str, bytes)):
-                continue
-            if isinstance(raw, bytes):
-                raw = raw.decode()
+                raw = message.get("data", "")
+                if not isinstance(raw, (str, bytes)):
+                    continue
+                if isinstance(raw, bytes):
+                    raw = raw.decode()
 
-            try:
-                payload = json.loads(raw)
-            except Exception:
-                continue
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    continue
 
-            event = payload.get("event", "message")
-            data  = json.dumps(payload.get("data", {}))
-            yield f"event: {event}\ndata: {data}\n\n"
+                event = payload.get("event", "message")
+                data  = json.dumps(payload.get("data", {}))
+                yield f"event: {event}\ndata: {data}\n\n"
 
-            if event == "done":
-                break
+                if event == "done":
+                    break
+    except asyncio.TimeoutError:
+        # Send a timeout done event so the client knows the stream ended
+        timeout_data = json.dumps({"task_id": task_id, "status": "timeout"})
+        yield f"event: done\ndata: {timeout_data}\n\n"
     finally:
         await pubsub.unsubscribe(_channel(task_id))
         await pubsub.aclose()

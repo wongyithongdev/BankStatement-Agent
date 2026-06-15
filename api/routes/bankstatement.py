@@ -11,11 +11,13 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from api.auth import get_current_user, require_book_access
 from api.sse import sse_done_response, sse_response
 from api.tasks.state import (
+    count_tasks,
     create_task,
     get_task,
     get_task_chat,
@@ -26,8 +28,9 @@ from api.tasks.worker import run_task
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/bankstatement", tags=["bankstatement"])
 
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/tmp/bankstatement/uploads"))
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/tmp/bankstatement/outputs"))
+UPLOAD_DIR  = Path(os.getenv("UPLOAD_DIR", "/tmp/bankstatement/uploads"))
+OUTPUT_DIR  = Path(os.getenv("OUTPUT_DIR", "/tmp/bankstatement/outputs"))
+MAX_PDF_MB  = int(os.getenv("MAX_PDF_MB", "50"))
 
 
 # ── Pydantic response models ───────────────────────────────────────────────
@@ -50,6 +53,7 @@ class TaskSummary(BaseModel):
 
 class TaskListResponse(BaseModel):
     tasks: list[TaskSummary]
+    total: int
     limit: int
     offset: int
 
@@ -76,6 +80,14 @@ async def upload_pdf(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
 
+    # Enforce upload size limit before reading into memory
+    max_bytes = MAX_PDF_MB * 1024 * 1024
+    if file.size and file.size > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"PDF exceeds the {MAX_PDF_MB} MB limit ({file.size // (1024*1024)} MB received)",
+        )
+
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -85,6 +97,12 @@ async def upload_pdf(
     xlsx_path = str(OUTPUT_DIR / f"{task_id}.xlsx")
 
     content = await file.read()
+    # Double-check size after read (some clients don't send Content-Length)
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"PDF exceeds the {MAX_PDF_MB} MB limit",
+        )
     with open(pdf_path, "wb") as f:
         f.write(content)
 
@@ -92,10 +110,9 @@ async def upload_pdf(
     redis = request.app.state.redis
     rpm   = request.app.state.rpm_limiter
 
-    # Pass our pre-generated task_id so file paths and DB record share the same UUID
     await create_task(db, book_id, user["user_id"], pdf_path, task_name=task_name, task_id=task_id)
 
-    active_tasks: set = request.app.state.active_tasks
+    active_tasks = request.app.state.active_tasks
     bg = asyncio.create_task(
         run_task(task_id, pdf_path, xlsx_path, book_id, task_name, db, redis, rpm)
     )
@@ -118,7 +135,10 @@ async def list_book_tasks(
 ):
     await require_book_access(book_id, "book.read", user["token"], request.app.state.http_client)
     db = request.app.state.db
-    rows = await list_tasks(db, book_id, limit=limit, offset=offset)
+    rows, total = await asyncio.gather(
+        list_tasks(db, book_id, limit=limit, offset=offset),
+        count_tasks(db, book_id),
+    )
     tasks = [
         TaskSummary(
             task_id=r["task_id"],
@@ -131,7 +151,7 @@ async def list_book_tasks(
         )
         for r in rows
     ]
-    return TaskListResponse(tasks=tasks, limit=limit, offset=offset)
+    return TaskListResponse(tasks=tasks, total=total, limit=limit, offset=offset)
 
 
 # ── GET /tasks/{task_id} ───────────────────────────────────────────────────
@@ -165,8 +185,6 @@ async def stream_task(
         raise HTTPException(status_code=404, detail="Task not found")
     await require_book_access(task["book_id"], "book.read", user["token"], request.app.state.http_client)
 
-    # If the task already finished before the client connected, return a
-    # synthetic done event immediately — the Redis pubsub message is gone.
     if task["status"] in ("completed", "failed"):
         return sse_done_response(task_id, task["status"], task.get("file_link"))
 
@@ -215,5 +233,4 @@ async def download_xlsx(
     if not file_link:
         raise HTTPException(status_code=404, detail="Output file not available")
 
-    from fastapi.responses import RedirectResponse
     return RedirectResponse(url=file_link, status_code=302)
