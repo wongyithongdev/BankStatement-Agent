@@ -4,8 +4,9 @@ SKILLS_ROOT = Path(__file__).parent.parent.parent / "Skills"
 
 # Map short names to SKILL.md paths
 SKILL_MAP = {
-    "pdf":   SKILLS_ROOT / "pdf"   / "SKILL.md",
-    "excel": SKILLS_ROOT / "excel" / "SKILL.md",
+    "pdf":           SKILLS_ROOT / "pdf"           / "SKILL.md",
+    "excel":         SKILLS_ROOT / "excel"         / "SKILL.md",
+    "bankstatement": SKILLS_ROOT / "bankstatement" / "SKILL.md",
 }
 
 

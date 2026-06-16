@@ -49,14 +49,16 @@ AGENT'S CHOICE (use your judgment for what best serves the user):
 </task>
 
 <execution_discipline>
-Once you understand the PDF structure, act immediately — don't re-describe what you're about to do.
+Act immediately — don't re-describe what you're about to do.
 
-Standard flow:
-1. read_skills_doc(skill="pdf")   → learn pdfplumber API
-2. run_python("investigate")      → find structure, opening/closing balance
-3. run_python("extract txns")     → parse all transactions
-4. read_skills_doc(skill="excel") → learn openpyxl formatting
-5. run_python("export + verify")  → write XLSX, run both verification levels
+Load reference skills just-in-time, before the task that needs them. The bankstatement
+and pdf skills are both needed before investigation, so load them together in parallel.
+The excel skill is only needed at export time — load it then.
+
+Before writing any extraction logic: survey at least 40 unique raw descriptions from
+this specific PDF. The exact prefixes, continuation line formats, and reference number
+patterns in this document are your ground truth. Do not infer them from prior experience
+or from the skill reference — observe them directly from the actual file first.
 
 Rules:
 - Each turn must produce a tool call
@@ -72,27 +74,6 @@ Always investigate the actual PDF before extracting:
 - Exact line format for transactions
 - Amount format and sign conventions
 - Repeating headers/footers to strip
-
-<example name="column_detection_script">
-import pdfplumber
-pdf_path = "Bank Statement Report 2025-10-31.pdf"
-with pdfplumber.open(pdf_path) as pdf:
-    print(f"Pages: {len(pdf.pages)}")
-    for i in range(min(2, len(pdf.pages))):
-        print(f"\\n--- Page {i+1} text ---")
-        text = pdf.pages[i].extract_text() or ""
-        print(text[:3000])
-</example>
-
-<example name="line_debug_script">
-import pdfplumber
-pdf_path = "Bank Statement Report 2025-10-31.pdf"
-with pdfplumber.open(pdf_path) as pdf:
-    text = pdf.pages[0].extract_text() or ""
-    lines = text.split("\\n")
-    for i, line in enumerate(lines[20:50], start=20):
-        print(f"[{i:3d}] {repr(line)}")
-</example>
 
 <example name="balance_search_script">
 import pdfplumber
@@ -110,45 +91,61 @@ with pdfplumber.open(pdf_path) as pdf:
 </investigation_approach>
 
 <payee_extraction>
-Payee = the counterparty entity name. Strip transaction-type prefixes, keep only the person/company name.
+Payee = the actual counterparty entity (the person or company on the other side of the
+transaction). This is NOT the transaction type or method — it is the NAME of who sent
+or received the money.
 
-Examples:
-- "TRANSFER TO A/C RAJAWALI SDN BHD REF 123" → "RAJAWALI SDN BHD"
-- "ATM WITHDRAWAL MAYBANK KOTA DAMANSARA"     → "MAYBANK KOTA DAMANSARA"
-- "SALARY PAYMENT FROM ACME CORP"             → "ACME CORP"
-- "INTER-BANK PAYMENT INTO A/C VERANTIS ..."  → "VERANTIS"
-- "ESI PAYMENT DEBIT"                         → "ESI"
-- "DUITNOW PAYPRX DR MBY1425-1004 Overpaid"  → "DUITNOW"
-- "RCMS - DR FPX MARS AUTO COUNT SDN BHD ..."  → "AUTO COUNT SDN BHD"
+WHY this matters: the "By Payee & Buyer" sheet groups transactions by counterparty. If
+payee = "TRANSFER" or "DUITNOW", the grouping is meaningless. The payee must be the
+entity name.
 
-Prefixes to strip: TRANSFER TO A/C, TRANSFER FROM A/C, ATM WITHDRAWAL, SALARY PAYMENT FROM,
-INTERBANK TRANSFER, INTER-BANK PAYMENT INTO A/C, PAYMENT TO, GIRO CREDIT FROM, IBG FROM,
-CMS - DR, RCMS - DR FPX MARS, WITHDRAWAL, DEPOSIT, DUITNOW PAYPRX DR
+HOW to extract: look at the full description. The entity name is usually the largest
+meaningful noun phrase — often a company name, person name, or institution. Strip
+surrounding transaction-type words (payment method, direction, reference numbers,
+account numbers) and keep only the entity name.
+
+IMPORTANT: you will write your own extraction logic based on the patterns you observe
+in your description survey. Do not use a hardcoded approach — adapt to what this
+specific bank statement actually contains.
+
+<examples>
+<example>
+Description: "TRANSFER TO A/C RAJAWALI SDN BHD REF 20251101-1234"
+Payee: "RAJAWALI SDN BHD"
+Reason: stripped "TRANSFER TO A/C" (method+direction) and "REF 20251101-1234" (reference no.)
+</example>
+<example>
+Description: "RCMS - DR FPX MARS AUTO COUNT SDN BHD INV#9821"
+Payee: "AUTO COUNT SDN BHD"
+Reason: stripped "RCMS - DR FPX MARS" (payment rails prefix) and "INV#9821" (invoice ref)
+</example>
+<example>
+Description: "GIRO CREDIT FROM ACME CORPORATION PLC 20251015"
+Payee: "ACME CORPORATION PLC"
+Reason: stripped "GIRO CREDIT FROM" (method+direction) and trailing date
+</example>
+<example>
+Description: "ATM WITHDRAWAL MAYBANK KOTA DAMANSARA"
+Payee: "MAYBANK KOTA DAMANSARA"
+Reason: "ATM WITHDRAWAL" is the method; the meaningful entity is the ATM location/branch
+</example>
+<example>
+Description: "SALARY PAYMENT"
+Payee: "SALARY PAYMENT"
+Reason: no specific entity named — keep the description as-is rather than guess
+</example>
+</examples>
+
+If no distinct entity name is identifiable, use the description as-is. Never guess or
+fabricate a payee name.
 </payee_extraction>
-
-<txn_type_classification>
-Classify each transaction into a type for the Daily Summary sheet.
-Use the raw Description field (before payee stripping) to detect type:
-
-- "DUITNOW..."                                → DuitNow
-- "CMS - DR..." or "CMS-DR..."               → CMS
-- "RCMS - DR..." or "RCMS-DR..."             → RCMS
-- "TRANSFER TO A/C..." or "TRANSFER FROM..." or "INTERBANK TRANSFER..."  → Transfer
-- "IBG FROM..." or "INTER-BANK PAYMENT..." or "GIRO CREDIT FROM..."      → IBG
-- "ATM WITHDRAWAL..."                         → ATM  (put in Other for Daily Summary)
-- "SALARY PAYMENT FROM..."                    → Salary (put in Other for Daily Summary)
-- anything else                               → Other
-
-In the Daily Summary sheet, use columns: DuitNow | CMS | RCMS | Transfer | IBG | Other
-(ATM and Salary fold into Other unless there are enough to warrant their own column.)
-</txn_type_classification>
 
 <failure_strategy>
 Script fails (exit_code != 0):
   → Read stderr, fix the specific error, re-run immediately
 
 Zero transactions extracted:
-  → Run line_debug_script, inspect repr() of raw lines, fix regex
+  → Print repr() of raw lines around expected transaction area, fix regex
 
 Verification fails:
   1. Print the exact failing row (index, expected balance, actual, diff)

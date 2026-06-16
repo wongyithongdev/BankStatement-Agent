@@ -1,361 +1,421 @@
 ---
 name: excel
-description: Use this skill whenever you need to write Excel (XLSX) files with formatting, colors, multiple sheets, summaries, or charts using openpyxl. Covers: cell colors, bold/italic fonts, column widths, frozen panes, borders, number formats, and building daily summary sheets from transaction data.
+description: Use this skill before writing any XLSX output for bank statement extraction. Provides exact color constants, helper functions, and complete sheet-writing functions for all 4 required sheets.
 license: MIT
 ---
 
-# Excel Formatting & Summary Guide (openpyxl)
+# Bank Statement Excel Export Guide (openpyxl)
 
 ## Core Imports
 
 ```python
-import openpyxl
 from openpyxl import Workbook
-from openpyxl.styles import (
-    PatternFill, Font, Alignment, Border, Side, numbers
-)
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from collections import OrderedDict
 ```
 
-## Color Constants (bank statement standard palette)
+## Color Palette
 
 ```python
-# Header
-COLOR_HEADER_BG   = "1F3864"   # dark navy blue
-COLOR_HEADER_FONT = "FFFFFF"   # white
+# ── Headers ────────────────────────────────────────────────────────────────
+COLOR_HEADER_BG    = "1F3864"   # dark navy  — sheet header row background
+COLOR_HEADER_FONT  = "FFFFFF"   # white      — sheet header row text
 
-# Transaction rows
-COLOR_CREDIT_BG   = "E2EFDA"   # light green  — credit rows
-COLOR_DEBIT_BG    = "FCE4D6"   # light orange — debit rows
-COLOR_ALT_BG      = "F2F2F2"   # light grey   — alternating blank rows
+# ── Transaction rows ───────────────────────────────────────────────────────
+COLOR_CREDIT_BG    = "E2EFDA"   # light green  — credit rows (money IN)
+COLOR_DEBIT_BG     = "FCE4D6"   # light orange — debit rows (money OUT)
 
-# Summary sheets
-COLOR_NET_POS     = "C6EFCE"   # green  — positive net
-COLOR_NET_NEG     = "FFC7CE"   # pink   — negative net
-COLOR_TOTAL_BG    = "BDD7EE"   # light blue — total row
+# ── Grouping & totals ──────────────────────────────────────────────────────
+COLOR_GROUP_BG     = "D9E1F2"   # soft blue   — payee group header
+COLOR_SUBTOTAL_BG  = "BDD7EE"   # light blue  — subtotal / total rows
+COLOR_SECTION_CR   = "375623"   # dark green  — CREDITS section header
+COLOR_SECTION_DR   = "843C0C"   # dark orange — DEBITS section header
 
-# Borders
-BORDER_COLOR      = "BFBFBF"
+# ── Summary sheet ─────────────────────────────────────────────────────────
+COLOR_SUMMARY_LABEL = "D6E4F0"  # pale blue   — label cells on summary sheet
+COLOR_SUMMARY_VALUE = "FFFFFF"  # white       — value cells on summary sheet
+
+# ── Misc ───────────────────────────────────────────────────────────────────
+COLOR_DATE_BG      = "EBF3FB"   # very light blue — date column in daily summary
+COLOR_BORDER       = "BFBFBF"   # grey        — cell borders
 ```
 
-## Helper Functions
+## Style Helpers
 
 ```python
-def make_fill(hex_color):
+def fill(hex_color):
     return PatternFill("solid", fgColor=hex_color)
 
-def make_font(bold=False, color="000000", size=10):
+def font(bold=False, color="000000", size=10):
     return Font(bold=bold, color=color, size=size, name="Calibri")
 
-def make_border():
-    side = Side(style="thin", color=BORDER_COLOR)
-    return Border(left=side, right=side, top=side, bottom=side)
+def border():
+    s = Side(style="thin", color=COLOR_BORDER)
+    return Border(left=s, right=s, top=s, bottom=s)
 
-def make_center():
-    return Alignment(horizontal="center", vertical="center", wrap_text=False)
+def align(h="left", wrap=False):
+    return Alignment(horizontal=h, vertical="center", wrap_text=wrap)
 
-def make_left():
-    return Alignment(horizontal="left", vertical="center", wrap_text=False)
+def money_fmt():
+    return '#,##0.00_);[Red](#,##0.00)'   # positives normal, negatives red in parens
+
+def zero_dash_fmt():
+    return '#,##0.00_);[Red](#,##0.00);"-"'  # zeros show as dash
 ```
 
-## Sheet 1 — Transactions (colored rows, formatted header)
+## Number Formatting Rules
+
+- **All monetary columns** (Credit, Debit, Balance, subtotals): use `money_fmt()` or `zero_dash_fmt()`
+- **Zero-value cells**: format as `"-"` not `"0.00"` — use `zero_dash_fmt()` on the whole column
+- **Dates**: store as plain string (as extracted from PDF), left-aligned
+- **Row numbers (No.)**: center-aligned, no number format
+- **Page numbers**: center-aligned, integer
+
+```python
+# Apply money format to a cell
+cell.number_format = money_fmt()
+
+# Apply zero-as-dash format (better for summary sheets with many zeros)
+cell.number_format = zero_dash_fmt()
+```
+
+## Sheet 1 — Summary (account overview)
+
+This is the FIRST sheet. It gives the reader an instant overview before they look at data.
+
+```python
+def write_summary_sheet(wb, meta):
+    """
+    meta dict keys:
+        account_name   str   — account holder name
+        account_no     str   — account number (masked OK: "1234-5678-****")
+        bank           str   — bank name
+        period_from    str   — statement start date
+        period_to      str   — statement end date
+        opening_bal    float — opening balance
+        closing_bal    float — closing balance
+        total_credits  float — sum of all credits
+        total_debits   float — sum of all debits
+        txn_count      int   — total transaction count
+        currency       str   — e.g. "MYR"
+    """
+    ws = wb.create_sheet("Summary", 0)   # insert at position 0 (first sheet)
+
+    # Column widths
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 32
+
+    # Title row
+    ws["A1"] = "BANK STATEMENT SUMMARY"
+    ws["A1"].font      = font(bold=True, color=COLOR_HEADER_FONT, size=14)
+    ws["A1"].fill      = fill(COLOR_HEADER_BG)
+    ws["A1"].alignment = align("center")
+    ws["B1"].fill      = fill(COLOR_HEADER_BG)
+    ws.row_dimensions[1].height = 30
+
+    rows = [
+        ("Account Holder",  meta.get("account_name", "—")),
+        ("Account Number",  meta.get("account_no", "—")),
+        ("Bank",            meta.get("bank", "—")),
+        ("Statement From",  meta.get("period_from", "—")),
+        ("Statement To",    meta.get("period_to", "—")),
+        ("Currency",        meta.get("currency", "MYR")),
+        (None, None),   # spacer
+        ("Opening Balance", meta.get("opening_bal", 0)),
+        ("Total Credits",   meta.get("total_credits", 0)),
+        ("Total Debits",    meta.get("total_debits", 0)),
+        ("Closing Balance", meta.get("closing_bal", 0)),
+        (None, None),   # spacer
+        ("Total Transactions", meta.get("txn_count", 0)),
+    ]
+
+    for r, (label, value) in enumerate(rows, start=2):
+        if label is None:
+            ws.row_dimensions[r].height = 8
+            continue
+        lc = ws.cell(row=r, column=1, value=label)
+        vc = ws.cell(row=r, column=2, value=value)
+        lc.fill      = fill(COLOR_SUMMARY_LABEL)
+        lc.font      = font(bold=True, size=11)
+        lc.alignment = align("left")
+        lc.border    = border()
+        vc.fill      = fill(COLOR_SUMMARY_VALUE)
+        vc.font      = font(size=11)
+        vc.alignment = align("right")
+        vc.border    = border()
+        # Format monetary rows
+        if label in ("Opening Balance", "Total Credits", "Total Debits", "Closing Balance"):
+            vc.number_format = money_fmt()
+        ws.row_dimensions[r].height = 20
+
+    return ws
+```
+
+## Sheet 2 — Transactions
 
 ```python
 def write_transactions_sheet(wb, transactions):
     """
     transactions: list of dicts with keys:
         page, date, description, payee, credit, debit, balance
+    credit/debit are float or None (never both filled).
     """
     ws = wb.active
     ws.title = "Transactions"
 
-    HEADERS = ["Page", "Date", "Description", "Payee", "Credit", "Debit", "Balance"]
+    HEADERS    = ["Page", "Date", "Description", "Payee", "Credit (RM)", "Debit (RM)", "Balance (RM)"]
+    COL_WIDTHS = [6,      14,     52,             28,      14,            14,            14]
 
-    # --- Column widths ---
-    col_widths = [6, 14, 50, 28, 12, 12, 14]
-    for i, width in enumerate(col_widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = width
+    for i, w in enumerate(COL_WIDTHS, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
 
-    # --- Header row ---
+    # Header row
     ws.append(HEADERS)
-    for col, cell in enumerate(ws[1], start=1):
-        cell.fill  = make_fill(COLOR_HEADER_BG)
-        cell.font  = make_font(bold=True, color=COLOR_HEADER_FONT, size=10)
-        cell.alignment = make_center()
-        cell.border = make_border()
-    ws.row_dimensions[1].height = 20
-
-    # Freeze header row
+    for cell in ws[1]:
+        cell.fill      = fill(COLOR_HEADER_BG)
+        cell.font      = font(bold=True, color=COLOR_HEADER_FONT, size=10)
+        cell.alignment = align("center")
+        cell.border    = border()
+    ws.row_dimensions[1].height = 22
     ws.freeze_panes = "A2"
 
-    # --- Transaction rows ---
+    # Data rows
     for i, t in enumerate(transactions, start=2):
         is_credit = bool(t.get("credit"))
-        row_color = COLOR_CREDIT_BG if is_credit else COLOR_DEBIT_BG
+        bg = COLOR_CREDIT_BG if is_credit else COLOR_DEBIT_BG
 
         ws.append([
-            t["page"],
-            t["date"],
-            t["description"],
-            t["payee"],
-            t["credit"] if t.get("credit") else "",
-            t["debit"]  if t.get("debit")  else "",
-            t["balance"],
+            t.get("page"),
+            t.get("date"),
+            t.get("description"),
+            t.get("payee"),
+            t.get("credit") if t.get("credit") else None,
+            t.get("debit")  if t.get("debit")  else None,
+            t.get("balance"),
         ])
 
         for col, cell in enumerate(ws[i], start=1):
-            cell.fill      = make_fill(row_color)
-            cell.border    = make_border()
-            cell.font      = make_font(size=10)
-            cell.alignment = make_left()
+            cell.fill   = fill(bg)
+            cell.border = border()
+            cell.font   = font(size=10)
+            if col == 1:                    # Page
+                cell.alignment = align("center")
+            elif col in (5, 6, 7):         # Credit / Debit / Balance
+                cell.alignment = align("right")
+                cell.number_format = zero_dash_fmt()
+            else:
+                cell.alignment = align("left")
 
-            # Right-align and format numeric columns
-            if col in (1, 5, 6, 7):   # Page, Credit, Debit, Balance
-                cell.alignment = make_center() if col == 1 else Alignment(horizontal="right")
-                if col in (5, 6, 7) and cell.value != "":
-                    cell.number_format = '#,##0.00'
-
-    # Auto-filter
     ws.auto_filter.ref = f"A1:G{len(transactions) + 1}"
-
     return ws
 ```
 
-## Transaction Type Classification
-
-Before building summary sheets, classify each transaction by type based on the raw Description field.
+## Sheet 3 — By Payee & Buyer
 
 ```python
 def classify_txn_type(description):
-    """
-    Classify a transaction by its description prefix.
-    Returns one of: "DuitNow", "CMS", "RCMS", "Transfer", "IBG", "ATM", "Salary", "Other"
-    """
-    desc = description.upper().strip()
-    if desc.startswith("DUITNOW"):
-        return "DuitNow"
-    elif desc.startswith("CMS -") or desc.startswith("CMS-"):
-        return "CMS"
-    elif desc.startswith("RCMS -") or desc.startswith("RCMS-"):
-        return "RCMS"
-    elif desc.startswith("TRANSFER TO") or desc.startswith("TRANSFER FROM") or desc.startswith("INTERBANK TRANSFER"):
-        return "Transfer"
-    elif desc.startswith("IBG FROM") or desc.startswith("INTER-BANK PAYMENT") or desc.startswith("GIRO CREDIT"):
-        return "IBG"
-    elif desc.startswith("ATM WITHDRAWAL"):
-        return "ATM"
-    elif desc.startswith("SALARY PAYMENT"):
-        return "Salary"
-    else:
-        return "Other"
-```
+    desc = (description or "").upper().strip()
+    if desc.startswith("DUITNOW"):                                          return "DuitNow"
+    if desc.startswith(("CMS -", "CMS-")):                                 return "CMS"
+    if desc.startswith(("RCMS -", "RCMS-")):                               return "RCMS"
+    if desc.startswith(("TRANSFER TO", "TRANSFER FROM", "INTERBANK")):     return "Transfer"
+    if desc.startswith(("IBG FROM", "INTER-BANK", "GIRO CREDIT")):         return "IBG"
+    return "Other"
 
-## Sheet 3 — By Payee & Buyer (detailed transactions grouped by entity)
 
-This sheet lists every individual transaction grouped by payee/payer — like a general ledger view.
-Structure: Section header → Payee group header → individual transaction rows → payee subtotal → next payee.
-
-```python
 def write_payee_buyer_sheet(wb, transactions):
-    """
-    Produces a detailed ledger grouped by Payee.
-    SECTION 1: BUYERS/PAYERS  — credit transactions (money IN)
-    SECTION 2: SUPPLIERS/VENDORS — debit transactions (money OUT)
-    """
     ws = wb.create_sheet("By Payee & Buyer")
 
-    HEADERS = ["No.", "Date", "Description", "Payee", "Type", "Debit (RM)", "Credit (RM)", "Balance (RM)"]
-    col_widths = [6, 14, 48, 28, 12, 14, 14, 14]
-    for i, w in enumerate(col_widths, start=1):
+    HEADERS    = ["No.", "Date", "Description", "Payee", "Type", "Debit (RM)", "Credit (RM)", "Balance (RM)"]
+    COL_WIDTHS = [6,     14,     50,             28,      12,     14,           14,             14]
+    for i, w in enumerate(COL_WIDTHS, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     ws.append(HEADERS)
     for cell in ws[1]:
-        cell.fill      = make_fill(COLOR_HEADER_BG)
-        cell.font      = make_font(bold=True, color=COLOR_HEADER_FONT)
-        cell.alignment = make_center()
-        cell.border    = make_border()
-    ws.row_dimensions[1].height = 20
+        cell.fill      = fill(COLOR_HEADER_BG)
+        cell.font      = font(bold=True, color=COLOR_HEADER_FONT, size=10)
+        cell.alignment = align("center")
+        cell.border    = border()
+    ws.row_dimensions[1].height = 22
     ws.freeze_panes = "A2"
 
-    from collections import OrderedDict
-
-    def _write_section(ws, section_label, txns, start_row, section_color):
-        row_num = start_row
-
-        # Section header row (full-width merge-style via fill)
-        ws.append([section_label, "", "", "", "", "", "", ""])
-        for col, cell in enumerate(ws[row_num], start=1):
-            cell.fill      = make_fill(section_color)
-            cell.font      = make_font(bold=True, size=11, color="FFFFFF")
-            cell.border    = make_border()
-            cell.alignment = make_left()
+    def _write_section(ws, label, txns, row_num, sec_color):
+        # Section header
+        ws.append([label] + [""] * 7)
+        for cell in ws[row_num]:
+            cell.fill      = fill(sec_color)
+            cell.font      = font(bold=True, color="FFFFFF", size=11)
+            cell.border    = border()
+            cell.alignment = align("left")
+        ws.row_dimensions[row_num].height = 22
         row_num += 1
 
-        # Group by payee (preserve encounter order)
         by_payee = OrderedDict()
         for t in txns:
-            by_payee.setdefault(t["payee"], []).append(t)
+            by_payee.setdefault(t.get("payee") or "Unknown", []).append(t)
 
         counter = 1
         for payee, ptxns in by_payee.items():
             # Payee group header
-            ws.append([payee, "", "", "", "", "", "", ""])
-            for col, cell in enumerate(ws[row_num], start=1):
-                cell.fill      = make_fill("D9E1F2")   # soft blue group header
-                cell.font      = make_font(bold=True)
-                cell.border    = make_border()
-                cell.alignment = make_left()
+            ws.append([payee] + [""] * 7)
+            for cell in ws[row_num]:
+                cell.fill      = fill(COLOR_GROUP_BG)
+                cell.font      = font(bold=True, size=10)
+                cell.border    = border()
+                cell.alignment = align("left")
             row_num += 1
 
-            # Individual transactions
             for t in ptxns:
-                txn_type = classify_txn_type(t["description"])
-                is_credit = bool(t.get("credit"))
-                row_color = COLOR_CREDIT_BG if is_credit else COLOR_DEBIT_BG
+                bg = COLOR_CREDIT_BG if t.get("credit") else COLOR_DEBIT_BG
                 ws.append([
                     counter,
-                    t["date"],
-                    t["description"][:60],
-                    t["payee"],
-                    txn_type,
-                    t["debit"]  if t.get("debit")  else "",
-                    t["credit"] if t.get("credit") else "",
-                    t["balance"],
+                    t.get("date"),
+                    (t.get("description") or "")[:60],
+                    t.get("payee"),
+                    classify_txn_type(t.get("description", "")),
+                    t.get("debit")   if t.get("debit")   else None,
+                    t.get("credit")  if t.get("credit")  else None,
+                    t.get("balance"),
                 ])
                 for col, cell in enumerate(ws[row_num], start=1):
-                    cell.fill   = make_fill(row_color)
-                    cell.border = make_border()
-                    cell.font   = make_font(size=10)
+                    cell.fill   = fill(bg)
+                    cell.border = border()
+                    cell.font   = font(size=10)
                     if col in (6, 7, 8):
-                        cell.alignment = Alignment(horizontal="right")
-                        if cell.value != "":
-                            cell.number_format = '#,##0.00'
+                        cell.alignment    = align("right")
+                        cell.number_format = zero_dash_fmt()
                     elif col == 1:
-                        cell.alignment = make_center()
+                        cell.alignment = align("center")
                     else:
-                        cell.alignment = make_left()
+                        cell.alignment = align("left")
                 row_num += 1
                 counter += 1
 
-            # Payee subtotal row
-            sub_debit  = sum(t.get("debit")  or 0 for t in ptxns)
-            sub_credit = sum(t.get("credit") or 0 for t in ptxns)
-            ws.append(["", f"Subtotal — {payee}", "", "", "", sub_debit or "", sub_credit or "", ""])
+            # Payee subtotal
+            sub_d = sum(t.get("debit")  or 0 for t in ptxns)
+            sub_c = sum(t.get("credit") or 0 for t in ptxns)
+            ws.append(["", f"Subtotal — {payee}", "", "", "",
+                        sub_d if sub_d else None,
+                        sub_c if sub_c else None, ""])
             for col, cell in enumerate(ws[row_num], start=1):
-                cell.fill   = make_fill(COLOR_TOTAL_BG)
-                cell.font   = make_font(bold=True)
-                cell.border = make_border()
+                cell.fill   = fill(COLOR_SUBTOTAL_BG)
+                cell.font   = font(bold=True, size=10)
+                cell.border = border()
                 if col in (6, 7):
-                    cell.alignment = Alignment(horizontal="right")
-                    if cell.value != "":
-                        cell.number_format = '#,##0.00'
+                    cell.alignment    = align("right")
+                    cell.number_format = money_fmt()
                 else:
-                    cell.alignment = make_left()
+                    cell.alignment = align("left")
             row_num += 1
 
         return row_num
 
-    # SECTION 1: Credits (buyers/payers — money IN)
-    credit_txns = [t for t in transactions if t.get("credit")]
+    credits = [t for t in transactions if t.get("credit")]
+    debits  = [t for t in transactions if t.get("debit")]
     row_num = 2
-    row_num = _write_section(ws, "SECTION 1: BUYERS / PAYERS (Credits)", credit_txns, row_num, "375623")
 
-    # Blank spacer row
-    ws.append([""] * 8)
+    row_num = _write_section(ws, "SECTION 1: BUYERS / PAYERS (Credits — Money IN)",
+                             credits, row_num, COLOR_SECTION_CR)
+    ws.append([""] * 8)   # spacer
     row_num += 1
-
-    # SECTION 2: Debits (suppliers/vendors — money OUT)
-    debit_txns = [t for t in transactions if t.get("debit")]
-    row_num = _write_section(ws, "SECTION 2: SUPPLIERS / VENDORS (Debits)", debit_txns, row_num, "843C0C")
+    row_num = _write_section(ws, "SECTION 2: SUPPLIERS / VENDORS (Debits — Money OUT)",
+                             debits, row_num, COLOR_SECTION_DR)
 
     ws.auto_filter.ref = f"A1:H{row_num}"
     return ws
 ```
 
-## Sheet 4 — Daily Summary by Transaction Type
-
-Columns break down each day by transaction type (DuitNow / CMS / RCMS / Transfer / IBG / Other),
-matching the JVS Trading Payment Summary format.
+## Sheet 4 — Daily Summary
 
 ```python
-def write_daily_type_summary_sheet(wb, transactions):
+def write_daily_summary_sheet(wb, transactions):
     """
-    Daily summary with columns per transaction type.
-    Mirrors: Date | DuitNow | CMS | RCMS | Transfer | IBG | Other | Daily Total | Txn Count
+    One row per date.
+    Columns: Date | DuitNow | CMS | RCMS | Transfer | IBG | Other | Daily Total | Count
+    Only include type columns that have at least one non-zero value.
     """
-    ws = wb.create_sheet("Daily Summary")
+    TYPES_ALL = ["DuitNow", "CMS", "RCMS", "Transfer", "IBG", "Other"]
 
-    TYPES   = ["DuitNow", "CMS", "RCMS", "Transfer", "IBG", "Other"]
-    HEADERS = ["Date"] + [f"{t} (RM)" for t in TYPES] + ["Daily Total (RM)", "Txn Count"]
-    col_widths = [14] + [14] * len(TYPES) + [16, 10]
-    for i, w in enumerate(col_widths, start=1):
+    # Aggregate by date and type
+    daily = OrderedDict()
+    for t in transactions:
+        d   = t.get("date", "Unknown")
+        typ = classify_txn_type(t.get("description", ""))
+        if d not in daily:
+            daily[d] = {tp: 0.0 for tp in TYPES_ALL}
+            daily[d]["_count"] = 0
+        amt = (t.get("credit") or 0) + (t.get("debit") or 0)
+        if typ not in TYPES_ALL:
+            typ = "Other"
+        daily[d][typ]    += amt
+        daily[d]["_count"] += 1
+
+    # Only keep types that have any data
+    active_types = [tp for tp in TYPES_ALL
+                    if any(daily[d][tp] != 0 for d in daily)]
+    if not active_types:
+        active_types = ["Other"]
+
+    ws = wb.create_sheet("Daily Summary")
+    HEADERS    = ["Date"] + [f"{tp} (RM)" for tp in active_types] + ["Daily Total (RM)", "Count"]
+    COL_WIDTHS = [14]    + [14] * len(active_types)               + [16,                10]
+    for i, w in enumerate(COL_WIDTHS, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     ws.append(HEADERS)
     for cell in ws[1]:
-        cell.fill      = make_fill(COLOR_HEADER_BG)
-        cell.font      = make_font(bold=True, color=COLOR_HEADER_FONT)
-        cell.alignment = make_center()
-        cell.border    = make_border()
-    ws.row_dimensions[1].height = 20
+        cell.fill      = fill(COLOR_HEADER_BG)
+        cell.font      = font(bold=True, color=COLOR_HEADER_FONT, size=10)
+        cell.alignment = align("center")
+        cell.border    = border()
+    ws.row_dimensions[1].height = 22
     ws.freeze_panes = "A2"
 
-    from collections import OrderedDict
-    daily = OrderedDict()
-    for t in transactions:
-        d = t["date"]
-        if d not in daily:
-            daily[d] = {typ: 0.0 for typ in TYPES}
-            daily[d]["count"] = 0
-        txn_type = classify_txn_type(t["description"])
-        amount   = (t.get("credit") or 0) + (t.get("debit") or 0)
-        bucket   = txn_type if txn_type in TYPES else "Other"
-        daily[d][bucket] += amount
-        daily[d]["count"] += 1
-
+    n_type_cols = len(active_types)
     row_num = 2
     for date, info in daily.items():
-        type_amounts = [info[typ] for typ in TYPES]
-        daily_total  = sum(type_amounts)
-        ws.append([date] + type_amounts + [daily_total, info["count"]])
+        amounts     = [info[tp] for tp in active_types]
+        daily_total = sum(amounts)
+        ws.append([date] + amounts + [daily_total, info["_count"]])
 
         for col, cell in enumerate(ws[row_num], start=1):
-            cell.border = make_border()
-            cell.font   = make_font()
+            cell.border = border()
+            cell.font   = font(size=10)
             if col == 1:
-                cell.fill      = make_fill("EBF3FB")
-                cell.alignment = make_center()
-            elif col == len(HEADERS):     # Txn Count
-                cell.fill      = make_fill("FFFFFF")
-                cell.alignment = make_center()
-            elif col == len(HEADERS) - 1: # Daily Total
-                cell.fill      = make_fill(COLOR_TOTAL_BG)
-                cell.font      = make_font(bold=True)
-                cell.alignment = Alignment(horizontal="right")
-                cell.number_format = '#,##0.00'
+                cell.fill      = fill(COLOR_DATE_BG)
+                cell.alignment = align("center")
+            elif col == n_type_cols + 2:   # Daily Total
+                cell.fill          = fill(COLOR_SUBTOTAL_BG)
+                cell.font          = font(bold=True, size=10)
+                cell.alignment     = align("right")
+                cell.number_format = money_fmt()
+            elif col == n_type_cols + 3:   # Count
+                cell.fill      = fill("FFFFFF")
+                cell.alignment = align("center")
             else:
-                cell.fill      = make_fill("FFFFFF")
-                cell.alignment = Alignment(horizontal="right")
-                if cell.value:
-                    cell.number_format = '#,##0.00'
+                cell.fill          = fill("FFFFFF")
+                cell.alignment     = align("right")
+                cell.number_format = zero_dash_fmt()
         row_num += 1
 
     # Grand total row
-    grand = {typ: sum(daily[d][typ] for d in daily) for typ in TYPES}
-    grand_total = sum(grand.values())
-    grand_count = sum(daily[d]["count"] for d in daily)
-    ws.append(["TOTAL"] + [grand[typ] for typ in TYPES] + [grand_total, grand_count])
+    totals    = [sum(daily[d][tp] for d in daily) for tp in active_types]
+    g_total   = sum(totals)
+    g_count   = sum(daily[d]["_count"] for d in daily)
+    ws.append(["TOTAL"] + totals + [g_total, g_count])
     for col, cell in enumerate(ws[row_num], start=1):
-        cell.fill   = make_fill(COLOR_TOTAL_BG)
-        cell.font   = make_font(bold=True)
-        cell.border = make_border()
-        if col > 1:
-            cell.alignment = Alignment(horizontal="right")
-            if col < len(HEADERS):
-                cell.number_format = '#,##0.00'
+        cell.fill   = fill(COLOR_SUBTOTAL_BG)
+        cell.font   = font(bold=True, size=10)
+        cell.border = border()
+        if col == 1:
+            cell.alignment = align("center")
+        elif col == n_type_cols + 3:
+            cell.alignment = align("center")
         else:
-            cell.alignment = make_center()
+            cell.alignment     = align("right")
+            cell.number_format = money_fmt()
 
     return ws
 ```
@@ -363,28 +423,32 @@ def write_daily_type_summary_sheet(wb, transactions):
 ## Complete Export Function
 
 ```python
-def export_to_excel(transactions, xlsx_path, opening_balance):
+def export_to_excel(transactions, xlsx_path, meta):
     """
-    transactions: list of dicts — page, date, description, payee, credit, debit, balance
-    xlsx_path: absolute path to output file
-    opening_balance: float — the opening balance of the statement period
+    transactions : list of dicts — page, date, description, payee, credit, debit, balance
+    xlsx_path    : absolute output path
+    meta         : dict — account_name, account_no, bank, period_from, period_to,
+                          opening_bal, closing_bal, total_credits, total_debits,
+                          txn_count, currency
     """
     wb = Workbook()
 
-    write_transactions_sheet(wb, transactions)
+    write_transactions_sheet(wb, transactions)   # uses wb.active — must be first
+    write_summary_sheet(wb, meta)                # inserts at position 0 (before Transactions)
     write_payee_buyer_sheet(wb, transactions)
-    write_daily_type_summary_sheet(wb, transactions)
+    write_daily_summary_sheet(wb, transactions)
 
     wb.save(xlsx_path)
-    print(f"Saved {len(transactions)} transactions to {xlsx_path}")
+    print(f"Saved: {xlsx_path}")
     print(f"Sheets: {[ws.title for ws in wb.worksheets]}")
+    print(f"Transactions: {len(transactions)}")
 ```
 
-## Important Notes
+## Usage Notes
 
-- `PatternFill` requires `fgColor` (not `bgColor`) for solid fills
-- Number format `'#,##0.00'` adds comma separators and 2 decimal places
-- `freeze_panes = "A2"` freezes the header row
+- Always call `write_transactions_sheet` first (it uses `wb.active`)
+- `write_summary_sheet` inserts at position 0 — call it second so Summary becomes sheet 1
+- `PatternFill` requires `fgColor` not `bgColor`
 - Always call `ws.append()` BEFORE applying styles to that row
-- Column letters: A=1, B=2, ... use `get_column_letter(n)` for programmatic access
-- `auto_filter.ref` must cover the full range including header
+- `zero_dash_fmt()` is better than `money_fmt()` for columns that often have blanks/zeros (Credit, Debit, type breakdown)
+- Column letters: use `get_column_letter(n)` for programmatic access (A=1, B=2…)

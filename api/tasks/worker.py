@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 # false positives from ordinary English words in the model's reasoning.
 _TOOL_STATE_SIGNALS = {
     "extracting": ["extract", "parse", "transaction", "parsing"],
-    "verifying":  ["verif", "level 1", "level 2", "l1", "l2", "balance"],
     "exporting":  ["export", "openpyxl", "workbook", "xlsx", "write excel"],
+    "verifying":  ["verif", "level 1", "level 2", "l1", "l2", "balance check"],
 }
 
 
