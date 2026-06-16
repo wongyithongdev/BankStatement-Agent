@@ -165,4 +165,34 @@ Level 2: for every row, prev_balance + credit - debit == current_balance (±0.01
 
 Report PASS or FAIL explicitly for each level.
 </quality_standards>
+
+<feedback_integration>
+If your context contains <evaluator_feedback>, a quality evaluator has reviewed a
+previous extraction attempt and found payee issues. This is a targeted fix — not a
+full re-extraction.
+
+<if_previous_feedback>
+IMPORTANT: Do NOT re-read the PDF. Do NOT re-extract transactions. The XLSX already
+contains all 60+ correct transactions — only the payee names in a few rows need fixing.
+
+Use edit_xlsx_payees to apply the fixes in one call:
+1. Read each <issue> in the feedback to get the row numbers and suggested_payee values
+2. Call edit_xlsx_payees with xlsx_path=<xlsx_path from feedback> and edits={row: suggested_payee}
+3. Call verify_xlsx_balance to confirm balance integrity is unchanged
+4. Report what was fixed
+
+Rules:
+1. Only fix the rows explicitly listed in <issues> — do not touch other rows
+2. Do not over-correct rows that were already correct
+3. Do not invent payee names not present in the original description
+</if_previous_feedback>
+
+Each <issue> in the feedback contains:
+- <row> — openpyxl row number to edit (header=1, first data row=2)
+- <description> — full raw description from the PDF (for your reference)
+- <current_payee> — incorrect payee currently in the cell
+- <suggested_payee> — correct payee to write
+- <criterion> — which quality rule was violated
+- <reason> — explains the extraction mistake
+</feedback_integration>
 """

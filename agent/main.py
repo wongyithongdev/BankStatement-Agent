@@ -77,6 +77,106 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_xlsx_payees",
+            "description": (
+                "Precisely edit Payee cells in the Transactions sheet without re-extracting from PDF. "
+                "Use this during feedback rounds to fix only the rows listed in <evaluator_feedback>. "
+                "ALWAYS prefer this over re-running the full extraction when you have a list of specific rows to fix. "
+                "Row numbers are openpyxl 1-based: row 1 = header, row 2 = first data row."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "xlsx_path": {
+                        "type": "string",
+                        "description": "Absolute path to the XLSX file to edit",
+                    },
+                    "edits": {
+                        "type": "object",
+                        "description": (
+                            "Mapping of openpyxl row number (string) → new payee name. "
+                            "E.g. {\"15\": \"RAJAWALI SDN BHD\", \"23\": \"MEADOW SDN BHD\"}"
+                        ),
+                        "additionalProperties": {"type": "string"},
+                    },
+                },
+                "required": ["xlsx_path", "edits"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_xlsx_balance",
+            "description": (
+                "Verify L1 (aggregate) and L2 (row-by-row) balance integrity of the Transactions sheet. "
+                "Returns structured pass/fail with exact failing rows. "
+                "Call this after edit_xlsx_payees to confirm the edits did not break balance integrity."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "xlsx_path": {
+                        "type": "string",
+                        "description": "Absolute path to the XLSX file to verify",
+                    },
+                },
+                "required": ["xlsx_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_xlsx_transactions",
+            "description": (
+                "Read all transactions from the Transactions sheet as structured data. "
+                "Returns columns list and rows list — each row is a dict keyed by column header. "
+                "Use this to inspect or verify the current XLSX content without running a script."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "xlsx_path": {
+                        "type": "string",
+                        "description": "Absolute path to the XLSX file to read",
+                    },
+                },
+                "required": ["xlsx_path"],
+            },
+        },
+    },
+]
+
+EVALUATOR_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": (
+                "Execute a Python script to read and filter the XLSX file. "
+                "Available libraries: openpyxl. "
+                "Use this to identify suspicious payees programmatically before judging them."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Complete Python script to execute",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "One line describing what this script does",
+                    },
+                },
+                "required": ["code", "description"],
+            },
+        },
+    }
 ]
 
 PROVIDERS = {
@@ -84,29 +184,33 @@ PROVIDERS = {
         "base_url": "https://openrouter.ai/api/v1",
         "model": "xiaomi/mimo-v2.5-pro",
         "env_key": "OPENROUTER_API_KEY",
-        # reasoning_effort via OpenRouter's extra_body
         "extra_body": {"reasoning": {"effort": "high"}},
+        "evaluator_model": "xiaomi/mimo-v2.5",
+        "evaluator_extra_body": {"reasoning": {"effort": "medium"}},
     },
     "deepinfra": {
         "base_url": "https://api.deepinfra.com/v1/openai",
         "model": "XiaomiMiMo/MiMo-V2.5-Pro",
         "env_key": "DEEPINFRA_API_KEY",
-        # DeepInfra passes reasoning_effort at top level
         "extra_body": {"reasoning_effort": "high"},
+        "evaluator_model": "XiaomiMiMo/MiMo-V2.5",
+        "evaluator_extra_body": {"reasoning_effort": "medium"},
     },
     "xiaomi": {
         "base_url": "https://api.xiaomimimo.com/v1",
         "model": "mimo-v2.5-pro",
         "env_key": "XIAOMI_MIMO_API_KEY",
-        # Xiaomi official uses chat_template_kwargs for vLLM
         "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+        "evaluator_model": "mimo-v2.5",
+        "evaluator_extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
     },
     "xiaomi-tokenplan": {
         "base_url": os.environ.get("XIAOMI_MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1"),
         "model": "mimo-v2.5-pro",
         "env_key": "XIAOMI_MIMO_API_KEY",
-        # Xiaomi Token Plan API (reasoning_effort support)
         "extra_body": {"reasoning_effort": "high"},
+        "evaluator_model": "mimo-v2.5",
+        "evaluator_extra_body": {"reasoning_effort": "medium"},
     },
 }
 
@@ -136,10 +240,13 @@ class BankStatementAgent:
         )
         self.model = model or preset["model"]
         self.extra_body = preset.get("extra_body", {})
-        self.max_turns = 15
+        self.evaluator_model = preset.get("evaluator_model", self.model)
+        self.evaluator_extra_body = preset.get("evaluator_extra_body", self.extra_body)
+        self.max_turns = 20
         self.state = {
             "skills_loaded": False,
             "trace": [],
+            "token_usage": [],   # per-turn token stats
         }
 
     # ------------------------------------------------------------------
@@ -203,33 +310,74 @@ class BankStatementAgent:
         return new_messages
 
     # ------------------------------------------------------------------
-    # Public entry point
+    # Public entry point — orchestrates extraction + evaluator loop
     # ------------------------------------------------------------------
 
     def extract(self, pdf_path: str, output_path: str = None, status_callback=None) -> dict:
+        """Public API. Runs extraction then Evaluator-Optimizer loop."""
         pdf_path = str(Path(pdf_path).resolve())
         if output_path is None:
             output_path = str(Path(pdf_path).with_suffix(".xlsx"))
+
+        result = self._run_extraction(pdf_path, output_path, status_callback)
+
+        if result.get("status") != "completed":
+            return result
+
+        return self._evaluator_loop(
+            xlsx_path=result["xlsx_path"],
+            pdf_path=pdf_path,
+            output_path=output_path,
+            status_callback=status_callback,
+            base_result=result,
+        )
+
+    # ------------------------------------------------------------------
+    # Extraction loop (single run, may receive evaluator feedback)
+    # ------------------------------------------------------------------
+
+    def _run_extraction(
+        self,
+        pdf_path: str,
+        output_path: str,
+        status_callback=None,
+        feedback: str = None,
+    ) -> dict:
+        """
+        Single extraction run.
+        feedback: optional <evaluator_feedback>...</evaluator_feedback> XML string
+                  injected into the initial user message for improvement runs.
+        """
         xlsx_path = output_path
+
+        self.state["token_usage"] = []   # reset per extraction run
 
         print(f"\n[Agent] Starting for: {pdf_path}")
         print(f"[Agent] Model: {self.model}  (reasoning_effort=high, streaming)")
         print(f"[Agent] Excel output: {xlsx_path}")
 
+        if feedback:
+            # Feedback round: targeted payee edits only — no PDF re-extraction
+            task_content = (
+                f"Fix payee quality issues in the existing Excel file.\n"
+                f"Excel file to edit: {xlsx_path}\n"
+                f"PDF (for reference only if a description is ambiguous): {pdf_path}\n\n"
+                f"{feedback}"
+            )
+        else:
+            task_content = (
+                f"Extract all transactions from this bank statement PDF "
+                f"and export to Excel.\n"
+                f"PDF: {pdf_path}\n"
+                f"Excel Output: {xlsx_path}"
+            )
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Extract all transactions from this bank statement PDF "
-                    f"and export to Excel.\n"
-                    f"PDF: {pdf_path}\n"
-                    f"Excel Output: {xlsx_path}"
-                ),
-            },
+            {"role": "user", "content": task_content},
         ]
 
-        stop_without_output = 0  # how many times agent stopped but produced no files
+        stop_without_output = 0
 
         for turn in range(self.max_turns):
             messages = self._compress_context(messages)
@@ -240,19 +388,25 @@ class BankStatementAgent:
             if status_callback:
                 status_callback("turn_start", {"turn": turn + 1})
 
-            finish_reason, full_content, tool_calls = self._stream_turn(messages, status_callback=status_callback)
+            finish_reason, full_content, tool_calls, usage = self._stream_turn(messages, status_callback=status_callback)
 
-            # Record the complete assistant message for chat history
             if status_callback and full_content:
                 status_callback("message", {"role": "assistant", "content": full_content, "turn": turn + 1})
 
-            self.state["trace"].append(
-                {"turn": turn + 1, "finish_reason": finish_reason}
+            est_flag = " (est)" if usage.get("estimated") else ""
+            print(
+                f"  [tokens{est_flag}] prompt={usage['prompt_tokens']:,}  "
+                f"completion={usage['completion_tokens']:,}  "
+                f"total={usage['total_tokens']:,}"
             )
+            self.state["trace"].append({
+                "turn": turn + 1,
+                "finish_reason": finish_reason,
+                "usage": usage,
+            })
+            self.state["token_usage"].append(usage)
 
             # ── Tool calls ──────────────────────────────────────────────
-            # Also handle finish_reason="length" when tool calls were already
-            # complete before the content response hit the token limit.
             if tool_calls and finish_reason in ("tool_calls", "length"):
                 assistant_msg = {
                     "role": "assistant",
@@ -295,10 +449,8 @@ class BankStatementAgent:
                     )
                 continue
 
-            # ── Hit token limit mid-response — continue the loop ────────
+            # ── Hit token limit mid-response ────────────────────────────
             if finish_reason == "length" and not tool_calls:
-                # Model was cut off while reasoning, no tool call was emitted.
-                # Append partial response and prompt it to act.
                 if full_content:
                     messages.append({"role": "assistant", "content": full_content})
                 messages.append({
@@ -316,8 +468,10 @@ class BankStatementAgent:
                 outputs = self._check_outputs(xlsx_path)
                 print(f"\n{'═'*60}")
                 if outputs["xlsx_exists"]:
+                    total_tok = sum(u.get("total_tokens", 0) for u in self.state["token_usage"])
                     print(f"[Agent] ✅ Completed — {outputs['xlsx_rows']} transactions")
                     print(f"[Agent]    XLSX: {xlsx_path}")
+                    print(f"[Agent]    Total tokens this run: {total_tok:,}")
                     return {
                         "status": "completed",
                         "xlsx_path": xlsx_path,
@@ -325,8 +479,6 @@ class BankStatementAgent:
                         "raw_response": full_content,
                         "trace": self.state["trace"],
                     }
-                # Agent stopped but produced no file — give environmental feedback
-                # and let it continue (Anthropic: ground truth from environment at each step)
                 stop_without_output += 1
                 if stop_without_output >= 2:
                     print("[Agent] ⚠️  Stopped twice without output — giving up.")
@@ -364,13 +516,251 @@ class BankStatementAgent:
         }
 
     # ------------------------------------------------------------------
+    # Evaluator-Optimizer loop (Anthropic official pattern)
+    # ------------------------------------------------------------------
+
+    def _evaluator_loop(
+        self,
+        xlsx_path: str,
+        pdf_path: str,
+        output_path: str,
+        status_callback,
+        base_result: dict,
+    ) -> dict:
+        """
+        Evaluator-Optimizer loop with 4 stopping conditions:
+          1. Quality threshold (score >= 8 or verdict == PASS)
+          2. Max iterations (3)
+          3. Token budget (max_tokens=4096 per evaluator call)
+          4. No improvement (2 consecutive same scores)
+        """
+        MAX_ITER = 3
+        PASS_THRESHOLD = 8
+        NO_IMPROVE_LIMIT = 2
+
+        attempts = []
+        best = base_result
+        best_score = 0
+        consecutive_same_score = 0
+        last_score = None
+
+        for iteration in range(MAX_ITER):
+            print(f"\n[Evaluator] iteration {iteration + 1}/{MAX_ITER} — assessing payee quality…")
+            if status_callback:
+                status_callback("token", {
+                    "text": f"\n[Evaluator] iteration {iteration + 1}/{MAX_ITER} — assessing payee quality…\n",
+                    "is_thinking": False,
+                })
+
+            eval_result = self._run_evaluator(xlsx_path, pdf_path)
+            score = eval_result["score"]
+            verdict = eval_result["verdict"]
+
+            print(f"[Evaluator] score={score}/10  verdict={verdict}  issues={len(eval_result['issues'])}")
+            if status_callback:
+                status_callback("token", {
+                    "text": f"[Evaluator] score={score}/10  verdict={verdict}  issues={len(eval_result['issues'])}\n",
+                    "is_thinking": False,
+                })
+
+            attempts.append({
+                "iteration": iteration + 1,
+                "score": score,
+                "verdict": verdict,
+                "issues": eval_result["issues"],
+                "feedback": eval_result["feedback"],
+                "xlsx_path": xlsx_path,
+            })
+
+            if score > best_score:
+                best_score = score
+                best = {
+                    **base_result,
+                    "xlsx_path": xlsx_path,
+                    "eval_score": score,
+                    "eval_iterations": iteration + 1,
+                }
+
+            # Stopping condition 1: quality
+            if verdict == "PASS" or score >= PASS_THRESHOLD:
+                print(f"[Evaluator] ✅ PASS — payee quality accepted (score {score}/10)")
+                break
+
+            # Stopping condition 4: no improvement
+            if score == last_score:
+                consecutive_same_score += 1
+            else:
+                consecutive_same_score = 0
+            last_score = score
+
+            if consecutive_same_score >= NO_IMPROVE_LIMIT:
+                print(f"[Evaluator] ⚠️  No improvement after {NO_IMPROVE_LIMIT} rounds — stopping")
+                break
+
+            # Stopping condition 2: max iterations
+            if iteration == MAX_ITER - 1:
+                print(f"[Evaluator] ⚠️  Max iterations reached")
+                break
+
+            # Build feedback and re-run generator
+            feedback_xml = self._build_feedback_xml(attempts, xlsx_path)
+            print(f"[Evaluator] Re-running generator with feedback ({len(eval_result['issues'])} issues)…")
+            if status_callback:
+                status_callback("token", {
+                    "text": f"[Evaluator] Re-running generator with {len(eval_result['issues'])} issue(s) to fix…\n",
+                    "is_thinking": False,
+                })
+
+            re_result = self._run_extraction(pdf_path, output_path, status_callback, feedback=feedback_xml)
+
+            if re_result.get("status") == "completed":
+                xlsx_path = re_result["xlsx_path"]
+            else:
+                print("[Evaluator] ⚠️  Re-extraction failed — using best result so far")
+                break
+
+        return best
+
+    def _run_evaluator(self, xlsx_path: str, pdf_path: str) -> dict:
+        """
+        Agentic evaluator: LLM writes Python to filter suspicious payees (programmatic),
+        then judges only the filtered subset (LLM judgment). Max 4 turns.
+        Returns {verdict, score, issues, feedback} — same contract as before.
+        """
+        import xml.etree.ElementTree as ET
+        from .evaluator_prompt import EVALUATOR_PROMPT
+        from .tools.run_python import run_python as _run_python
+
+        messages = [
+            {"role": "system", "content": EVALUATOR_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Evaluate payee quality in this bank statement extraction.\n"
+                    f"XLSX file: {xlsx_path}"
+                ),
+            },
+        ]
+
+        eval_total_tokens = 0
+        for turn in range(4):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.evaluator_model,
+                    max_tokens=8192,
+                    tools=EVALUATOR_TOOLS,
+                    tool_choice="auto",
+                    messages=messages,
+                    extra_body=self.evaluator_extra_body,
+                )
+            except Exception as exc:
+                logger.warning("evaluator call failed: %s — treating as PASS", exc)
+                return {"verdict": "PASS", "score": 10, "issues": [], "feedback": f"evaluator error: {exc}"}
+
+            if hasattr(response, "usage") and response.usage:
+                t = response.usage.total_tokens
+                eval_total_tokens += t
+                print(f"  [Evaluator tokens] turn={turn+1}  total={t:,}  cumulative={eval_total_tokens:,}")
+
+            choice = response.choices[0]
+            msg = choice.message
+
+            # ── Tool call: execute run_python ───────────────────────────
+            if choice.finish_reason == "tool_calls" and msg.tool_calls:
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": msg.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in msg.tool_calls
+                    ],
+                }
+                messages.append(assistant_msg)
+
+                for tc in msg.tool_calls:
+                    if tc.function.name == "run_python":
+                        try:
+                            inputs = json.loads(tc.function.arguments or "{}")
+                        except json.JSONDecodeError:
+                            inputs = {}
+                        print(f"  [Evaluator] {inputs.get('description', 'filter script')}")
+                        result = _run_python(
+                            code=inputs.get("code", ""),
+                            description=inputs.get("description", ""),
+                        )
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": json.dumps(result),
+                        })
+                continue
+
+            # ── Stop: parse XML verdict ─────────────────────────────────
+            raw = msg.content or ""
+            try:
+                start = raw.index("<evaluation>")
+                end = raw.rindex("</evaluation>") + len("</evaluation>")
+                root = ET.fromstring(raw[start:end])
+                score = int(root.findtext("score") or "0")
+                verdict = (root.findtext("verdict") or "NEEDS_IMPROVEMENT").strip()
+                feedback = (root.findtext("feedback") or "").strip()
+                issues = []
+                for issue in root.findall(".//issue"):
+                    issues.append({
+                        "row": issue.findtext("row") or "",
+                        "description": issue.findtext("description") or "",
+                        "current_payee": issue.findtext("current_payee") or "",
+                        "suggested_payee": issue.findtext("suggested_payee") or "",
+                        "criterion": issue.findtext("criterion") or "",
+                        "reason": issue.findtext("reason") or "",
+                    })
+                return {"verdict": verdict, "score": score, "issues": issues, "feedback": feedback}
+            except Exception as exc:
+                logger.warning("evaluator XML parse failed: %s — raw: %.200s", exc, raw)
+                return {"verdict": "PASS", "score": 10, "issues": [], "feedback": "XML parse error — accepted as-is"}
+
+        return {"verdict": "PASS", "score": 10, "issues": [], "feedback": "evaluator max turns reached"}
+
+    def _build_feedback_xml(self, attempts: list, xlsx_path: str) -> str:
+        """Format the latest evaluator feedback for injection into generator context."""
+        latest = attempts[-1]
+        lines = [
+            f'<evaluator_feedback iteration="{latest["iteration"]}" score="{latest["score"]}/10">',
+            f"  <xlsx_path>{xlsx_path}</xlsx_path>",
+            f"  <summary>{latest['feedback']}</summary>",
+            "",
+            "  Fix these specific payees using edit_xlsx_payees (do NOT re-extract from PDF):",
+            "  <issues>",
+        ]
+        for issue in latest["issues"]:
+            lines.append("    <issue>")
+            lines.append(f"      <row>{issue['row']}</row>")
+            lines.append(f"      <description>{issue['description']}</description>")
+            lines.append(f"      <current_payee>{issue['current_payee']}</current_payee>")
+            lines.append(f"      <suggested_payee>{issue['suggested_payee']}</suggested_payee>")
+            lines.append(f"      <criterion>{issue['criterion']}</criterion>")
+            lines.append(f"      <reason>{issue['reason']}</reason>")
+            lines.append("    </issue>")
+        lines.append("  </issues>")
+        lines.append("</evaluator_feedback>")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Streaming
     # ------------------------------------------------------------------
 
-    def _stream_turn(self, messages: list, status_callback=None) -> tuple[str, str, dict]:
+    def _stream_turn(self, messages: list, status_callback=None) -> tuple[str, str, dict, dict]:
         """
         Stream one API call.
-        Returns (finish_reason, full_content, tool_calls_map).
+        Returns (finish_reason, full_content, tool_calls_map, usage).
+        usage = {prompt_tokens, completion_tokens, total_tokens} (real or estimated).
         Prints thinking tokens in dim color and response text normally.
         """
         THINK_OPEN  = "\033[2m"   # dim  — thinking
@@ -383,6 +773,7 @@ class BankStatementAgent:
             tools=TOOLS,
             tool_choice="auto",
             stream=True,
+            stream_options={"include_usage": True},
             extra_body=self.extra_body,
             messages=messages,
         )
@@ -391,8 +782,17 @@ class BankStatementAgent:
         tool_calls: dict[int, dict] = {}  # index → {id, name, arguments}
         finish_reason = "stop"
         in_think_tag = False
+        usage: dict = {}
 
         for chunk in stream:
+            # Usage arrives in a final chunk (no choices) when stream_options=include_usage
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage = {
+                    "prompt_tokens":     chunk.usage.prompt_tokens,
+                    "completion_tokens": chunk.usage.completion_tokens,
+                    "total_tokens":      chunk.usage.total_tokens,
+                }
+
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]
@@ -472,7 +872,18 @@ class BankStatementAgent:
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-        return finish_reason, full_content, tool_calls
+        # Fall back to character-based estimation if provider didn't return usage
+        if not usage:
+            est_prompt = self._estimate_tokens(messages)
+            est_completion = len(full_content) // 4
+            usage = {
+                "prompt_tokens":     est_prompt,
+                "completion_tokens": est_completion,
+                "total_tokens":      est_prompt + est_completion,
+                "estimated":         True,
+            }
+
+        return finish_reason, full_content, tool_calls, usage
 
     # ------------------------------------------------------------------
     # Tool execution
@@ -505,6 +916,40 @@ class BankStatementAgent:
             print(f"     {status} exit={result['exit_code']}  out: {stdout_preview}")
             return result
 
+        if name == "edit_xlsx_payees":
+            from .tools.edit_xlsx import edit_xlsx_payees
+            xlsx_path = inputs.get("xlsx_path", "")
+            edits = inputs.get("edits", {})
+            print(f"     Editing {len(edits)} payee(s) in {xlsx_path}")
+            result = edit_xlsx_payees(xlsx_path=xlsx_path, edits=edits)
+            status = "✅" if result["ok"] else "❌"
+            print(f"     {status} edited={result.get('edited_count', 0)}  errors={result.get('errors', [])}")
+            return result
+
+        if name == "verify_xlsx_balance":
+            from .tools.verify_balance import verify_xlsx_balance
+            xlsx_path = inputs.get("xlsx_path", "")
+            print(f"     Verifying balance: {xlsx_path}")
+            result = verify_xlsx_balance(xlsx_path=xlsx_path)
+            if result.get("ok"):
+                l1 = "✅" if result["l1_pass"] else "❌"
+                l2 = "✅" if result["l2_pass"] else "❌"
+                print(f"     L1:{l1} L2:{l2}  rows={result['total_rows']}  failed={len(result['failed_rows'])}")
+            else:
+                print(f"     ❌ {result.get('error')}")
+            return result
+
+        if name == "read_xlsx_transactions":
+            from .tools.read_xlsx import read_xlsx_transactions
+            xlsx_path = inputs.get("xlsx_path", "")
+            print(f"     Reading transactions from {xlsx_path}")
+            result = read_xlsx_transactions(xlsx_path=xlsx_path)
+            if result.get("ok"):
+                print(f"     ✅ {result['total_rows']} rows, columns: {result['columns']}")
+            else:
+                print(f"     ❌ {result.get('error')}")
+            return result
+
         return {"ok": False, "error": f"Unknown tool: {name}"}
 
     # ------------------------------------------------------------------
@@ -518,8 +963,9 @@ class BankStatementAgent:
             try:
                 import openpyxl
                 wb = openpyxl.load_workbook(xlsx_p)
-                ws = wb.active
-                xlsx_rows = ws.max_row - 1  # subtract header
+                # Prefer "Transactions" sheet; fall back to active
+                ws = wb["Transactions"] if "Transactions" in wb.sheetnames else wb.active
+                xlsx_rows = ws.max_row - 1  # subtract header row
             except Exception:
                 xlsx_rows = -1
         return {
